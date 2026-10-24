@@ -7,6 +7,7 @@ The grey/blue translucent robot is the reference pose; the solid robot is the po
 Deterministic evaluation settings (no noise, no DR); every reset starts the clip from its first frame.
 Native MuJoCo viewer when a display is available, otherwise viser (browser, http://localhost:8080).
 Keys (native): space pause, right-arrow single step, +/- speed, backspace reset.
+--no-terminations disables the pelvis height / tilt resets, e.g. to watch a get-up policy (plan D22) recover.
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ def main(
     viewer: Literal["auto", "native", "viser"] = "auto",
     ghost: bool = True,
     sampling: Literal["start", "uniform"] = "start",
+    no_terminations: bool = False,
 ) -> None:
     files = [str(f) for f in discover_npz(npz_dir, names=clips)]
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
@@ -62,6 +64,7 @@ def main(
         seed=0,
         anchor_obs=cfg["env"].get("anchor_obs", False),
         debug_vis=ghost,
+        **({"root_height_threshold": 1.0e3, "root_tilt_threshold": 1.0e3} if no_terminations else {}),
     )
     env = RslRlVecEnvWrapper(make_env(args, device=device))
     pol = _DictPolicy(policy)

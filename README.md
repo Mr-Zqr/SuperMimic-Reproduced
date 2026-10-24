@@ -113,6 +113,32 @@ env -u PYTHONPATH uv run python scripts/eval_benchmark.py --ckpt logs/e5/ckpt_la
 env -u PYTHONPATH uv run python scripts/play.py --ckpt logs/e7/ckpt_latest.pt --clips dance1_subject1
 ```
 
+## 摔倒起身（plan D22）
+
+论文只有骨盆高度 / 倾角两条失败终止，策略从没见过摔倒之后的状态。get-up 训练让一部分回合关闭失败终止、加击倒推力、并从躺姿开始重置，策略因此学会倒地后自己站起来。三项默认都关闭（论文行为），设计见 `docs/REPRODUCTION_PLAN.md` D22，实验见 `docs/EXPERIMENTS.md`。
+
+**训好的模型**：[huggingface.co/RayZhao/supermimic_getup](https://huggingface.co/RayZhao/supermimic_getup)（`policy.pt` 可直接用下面的脚本加载；另有完整训练状态与回放视频）。在 26 万次迭代时，俯卧 / 仰卧 / 侧卧起身成功率均为 100%（中位 1.3–1.5 s），4–6 m/s 推力下推倒率 0%，2000 条 BONES 平地子集跟踪回报 0.912。
+
+```bash
+hf download RayZhao/supermimic_getup policy.pt --local-dir checkpoints
+# 观察倒地起身：关闭骨盆高度 / 倾角重置
+env -u PYTHONPATH uv run python scripts/play.py --ckpt checkpoints/policy.pt --npz-dir data/npz/lafan1 \
+  --clips fallAndGetUp1_subject1 --no-terminations
+```
+
+在已训好的跟踪策略上续训（该模型：18 万次迭代的跟踪基线续训到 26 万次，学习率恒定 2e-5；以下三项依次加入）：
+
+```bash
+env -u PYTHONPATH uv run sm-train --run-name getup --resume logs/<tracking_run>/ckpt_latest.pt \
+  --data.library data/library/<library>.pt --env.num-envs 4096 \
+  --env.immune-probability 0.3 --env.push-interval-s 2.0 4.0 --env.push-speed 4.0 6.0 \
+  --env.lie-probability 0.1
+```
+
+- `--env.immune-probability`：在跑环境中关闭失败终止的目标比例；免疫回合不更新重置采样器，世界模型对它们不预测终止，critic 额外输入免疫标志（策略不看）。
+- `--env.push-interval-s` / `--env.push-speed`：每 2–4 s 一次的根部速度冲量（水平 4–6 m/s，30% 附带向下）；被推的那一步不进入世界模型训练窗口。
+- `--env.lie-probability`：从俯卧 / 仰卧 / 侧卧落地开始的重置比例，这类回合一律免疫。
+
 ## 与论文的对应及已知差异
 
 - 实现了 Algorithm A.1 全流程、Table A.1–A.6 的观测/奖励/终止/网络/超参、Appendix F 评测协议、D 节域随机化（sim context ξ）。
