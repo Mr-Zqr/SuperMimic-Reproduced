@@ -256,6 +256,16 @@ uv run list-envs                                 # 应列出 Mjlab-Tracking-Flat
 - 分组：本体观测五项放观测组 `policy`，组级 `history_length=10`；目标项（680 维）放**独立观测组** `goal`，不带历史。原因：组级 `history_length` 会覆盖组内所有项（`observation_manager.py:461-463`），若目标项同组会被堆成 6800 维。
 - 初始化：回合开始时用首帧观测回填 10 帧历史（`CircularBuffer` 的 backfill 语义）；想象起点的历史从 replay buffer 同一环境槽位的前 9 步取，跨回合边界处用起点观测回填。
 
+**D22（新增，2026-10-23）免疫终止：摔倒后起身。**
+- 动机：论文只有骨盆高度 / 倾角两条失败终止，策略从未见过"摔倒之后"的状态，跟丢即重置。参照 BeyondMimic 系的 immune termination：随机一部分回合关闭失败终止，摔倒后继续 rollout 到 clip 末尾或 10 s 超时，tracking 奖励（`exp(-err/std)`，参考仍站立）把机器人拉回参考姿态。
+- 与 Isaac Lab 原版的差异：这里没有 keypoint error 终止，失败终止就是 `root_height` 与 `root_tilt`，两者**共用**同一免疫标志（只免一条无法摔倒后继续）；免疫状态挂在 `MultiClipMotionCommand.immune`，**每回合在重置时抽一次**，回合内恒定，与 ξ 同属回合常量，而非每 200 步重抽。`env.immune_probability`（默认 0 = 论文行为）是**在跑环境中免疫的目标比例**：免疫回合不会失败、活得更久，固定的每次重置概率会让它们占满（p = 0.5、剧烈随机动作下实测在跑比例 0.88），所以重置时按配额补足，概率 = (目标 × N − 其余在跑免疫数) / 重置数，截到 [0, 1]；评测（`forced_frame` / `reset_to_frame`）一律不免疫。不加开局 grace period、不挂奖励。
+- 世界模型：动力学不变（物理与免疫无关）；终止由 `WorldModel.termination_logits(s, ref, immune)` 给出，免疫时 logit 固定为 −30（d̂ ≈ 0，无梯度到终止头），训练与想象用同一函数。终止头的 BCE 只在非免疫行上平均（免疫回合的 0 标签与终止规则无关，留着会让头学到"大误差也不终止"）。replay buffer 每行存 `immune`，窗口与想象起点取起始行的值。
+- critic：输入加 1 维免疫标志（同状态下免疫回合仍有后续奖励，非免疫回合价值为 0）；**策略不看**。旧检查点 critic 首层补一列 0，critic 优化器重置。
+- 采样器：免疫回合不更新 G_b（`sampler_skip_immune=True`）。摔倒后的近零奖励会被记到之后若干 bin 上，把并没真正尝试过的 bin 标成难。
+- 击倒推力（`env.push_interval_s`，默认关）：只开免疫时，180k 策略在训练中几乎不摔（免疫回合平均 110 步 vs 非免疫 107 步），起身数据太少。`events.big_push` 每 env 每 2–4 s 一次，对所有 env 同分布：根部水平速度加 4–6 m/s（随机方向）、roll/pitch 角速度加 U(−3, 3) rad/s，30% 的推再加 1.5–3 m/s 向下速度。站立 T-pose 下 188k 策略被 3–5 m/s 击倒 57%、4–6 m/s 击倒 91%，取后者。用瞬时速度冲量而非持续外力：世界模型看不到外力，冲量只污染它所在的一个 transition。该 transition 在 replay buffer 中标 `cut`，世界模型窗口不跨越它（推后的状态仍可作想象起点）；被推过的回合不更新 G_b（推在哪摔就在哪，与 bin 难度无关）。
+- 倒地起始（`env.lie_probability`，默认 0）：免疫 + 推力训到 208k 后，平躺仰面起身 100%（中位 1.4 s），俯卧 0%。推倒时策略学会了向后坐倒，训练数据几乎没有俯卧状态。按该比例的重置把机器人以参考关节姿态、零速度、从骨盆高 0.35–0.55 m 处落到地面（腾空高度避开伸出的手臂穿地），姿态 40% 俯卧（pitch +90°）、30% 仰卧（−90°）、30% 侧卧（roll ±90°），随机航向并加 ±0.3 rad roll/pitch 扰动。倒地起始回合一律免疫（否则首步就被根部终止），也因此不更新 G_b；评测的 `forced_frame` 不受影响。
+- 日志：`train/episode_norm_return` 只统计非免疫回合（与旧实验可比）；免疫回合另记 `train/immune_episode_norm_return`、`train/immune_episode_len`，以及 `train/immune_frac`、`policy/imag_immune_frac`。
+
 ---
 
 ## 5. Repo 结构（实施骨架）
