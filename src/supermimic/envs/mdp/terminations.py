@@ -1,4 +1,7 @@
-"""Paper terminations: root (pelvis) height deviation and tilt; clip end as time-out."""
+"""Paper terminations: root (pelvis) height deviation and tilt; clip end as time-out.
+
+Both root terminations are masked for the command's ``immune`` episodes (get-up training, plan D22).
+"""
 
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ if TYPE_CHECKING:
 
 def bad_root_height(env: ManagerBasedRlEnv, command_name: str, threshold: float = 0.25) -> torch.Tensor:
     cmd = cast(MultiClipMotionCommand, env.command_manager.get_term(command_name))
-    return (cmd.root_pos_w[:, 2] - cmd.robot_root_pos_w[:, 2]).abs() > threshold
+    return ((cmd.root_pos_w[:, 2] - cmd.robot_root_pos_w[:, 2]).abs() > threshold) & ~cmd.immune
 
 
 def bad_root_tilt(env: ManagerBasedRlEnv, command_name: str, threshold: float = 0.8) -> torch.Tensor:
@@ -23,7 +26,7 @@ def bad_root_tilt(env: ManagerBasedRlEnv, command_name: str, threshold: float = 
     g = cmd.robot.data.gravity_vec_w
     ref = quat_apply_inverse(cmd.root_quat_w, g)[:, 2]
     rob = quat_apply_inverse(cmd.robot_root_quat_w, g)[:, 2]
-    return (ref - rob).abs() > threshold
+    return ((ref - rob).abs() > threshold) & ~cmd.immune
 
 
 def clip_end(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:

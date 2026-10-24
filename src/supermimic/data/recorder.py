@@ -38,6 +38,9 @@ class ReplayRecorder(RecorderTerm):
         self.buffer = ReplayBuffer(n, int(p["capacity"]), STATE_DIM, 29, XI_DIM, env.device)
         self.prev_s = torch.zeros(n, STATE_DIM, device=env.device)
         self.prev_xi = torch.zeros(n, XI_DIM, device=env.device)
+        self.prev_immune = torch.zeros(n, dtype=torch.bool, device=env.device)
+        # Set by events.big_push: the state after this step's transition was kicked by an external push.
+        self.pending_cut = torch.zeros(n, dtype=torch.bool, device=env.device)
         self.prev_frame = torch.zeros(n, dtype=torch.long, device=env.device)
         self.prev_clip = torch.zeros(n, dtype=torch.long, device=env.device)
         self.ep_start = torch.ones(n, dtype=torch.bool, device=env.device)
@@ -56,6 +59,7 @@ class ReplayRecorder(RecorderTerm):
         cmd = self.command
         self.prev_s[ids] = self.state_io.read()[ids]
         self.prev_xi[ids] = self.ctx.read()[ids]
+        self.prev_immune[ids] = cmd.immune[ids]
         self.prev_frame[ids] = cmd.frame[ids]
         self.prev_clip[ids] = cmd.library.frame_clip[cmd.frame[ids]]
 
@@ -79,8 +83,11 @@ class ReplayRecorder(RecorderTerm):
             clip=self.prev_clip[ids],
             terminal=torch.zeros_like(done_next, dtype=torch.bool),
             ep_start=self.ep_start[ids],
+            immune=self.prev_immune[ids],
+            cut=self.pending_cut[ids],
         )
         self.ep_start[ids] = False
+        self.pending_cut[ids] = False
 
     def record_pre_reset(self, env_ids: torch.Tensor) -> None:
         if not self.enabled or env_ids.numel() == 0:
@@ -104,6 +111,7 @@ class ReplayRecorder(RecorderTerm):
             clip=cmd.library.frame_clip[cmd.frame[env_ids]],
             terminal=torch.ones(env_ids.numel(), dtype=torch.bool, device=env.device),
             ep_start=torch.zeros(env_ids.numel(), dtype=torch.bool, device=env.device),
+            immune=self.prev_immune[env_ids],
         )
         self.buffer.end_episode(env_ids)
 

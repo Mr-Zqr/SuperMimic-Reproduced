@@ -7,7 +7,9 @@ Differences from mjlab's BeyondMimic re-implementation (``mjlab.tasks.tracking``
   * multi-clip command with return-based reset sampling and clip-end time-outs;
   * rewards: self-collision term removed, joint-limit weight -2;
   * terminations: pelvis height / tilt vs reference, no end-effector term, clip-end time-out;
-  * events: no push; friction and encoder bias re-sampled per episode; COM at startup;
+    optionally disabled for a random fraction of episodes (get-up training, plan D22);
+  * events: no push by default (optional large knock-down pushes for get-up training, plan D22);
+    friction and encoder bias re-sampled per episode; COM at startup;
   * a ``ReplayRecorder`` streams transitions into a GPU replay buffer.
 """
 
@@ -33,6 +35,7 @@ from mjlab.viewer import ViewerConfig
 
 from supermimic.data.recorder import ReplayRecorderCfg
 from supermimic.envs.actions import NoisyJointPositionActionCfg
+from supermimic.envs.mdp import events as sm_events
 from supermimic.envs.mdp import observations as sm_obs
 from supermimic.envs.mdp import terminations as sm_term
 from supermimic.envs.mdp.commands import MultiClipMotionCommandCfg
@@ -88,6 +91,13 @@ class SuperMimicEnvCfgArgs:
     bin_frames: int = 50
     compact_library: bool = False
     anchor_obs: bool = False  # add BeyondMimic anchor-relative pose (9) to the goal group (plan D5 alt.)
+    immune_probability: float = 0.0  # episodes whose root terminations are disabled (get-up, plan D22)
+    lie_probability: float = 0.0  # fraction of resets that start lying on the floor, always immune (D22)
+    push_interval_s: tuple[float, float] | None = None  # knock-down pushes per env (D22); None = off
+    push_speed: tuple[float, float] = (4.0, 6.0)  # horizontal kick (m/s): 91% of standing robots fall (D22)
+    push_ang_speed: float = 3.0  # roll / pitch kick half-range (rad/s)
+    push_down_prob: float = 0.3  # fraction of pushes that also kick downwards
+    push_down_speed: tuple[float, float] = (1.5, 3.0)  # downward kick (m/s)
     debug_vis: bool = False  # draw the reference ghost in the viewer (scripts/play.py)
     extra_command_kwargs: dict = field(default_factory=dict)
 
@@ -154,6 +164,8 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             velocity_range=vel_range if a.reset_noise else {},
             joint_position_range=(-0.1, 0.1) if a.reset_noise else (0.0, 0.0),
             sampling_mode=a.sampling_mode,  # type: ignore[arg-type]
+            immune_probability=a.immune_probability,
+            lie_probability=a.lie_probability,
             compact_library=a.compact_library,
             debug_vis=a.debug_vis,
             **a.extra_command_kwargs,
@@ -197,6 +209,19 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
                 "operation": "abs",
                 "ranges": (1.0, 1.0),
                 "shared_random": True,
+            },
+        )
+
+    if a.push_interval_s is not None:
+        events["push"] = EventTermCfg(
+            mode="interval",
+            func=sm_events.big_push,
+            interval_range_s=a.push_interval_s,
+            params={
+                "speed_range": a.push_speed,
+                "ang_speed": a.push_ang_speed,
+                "down_prob": a.push_down_prob,
+                "down_speed_range": a.push_down_speed,
             },
         )
 

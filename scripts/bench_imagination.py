@@ -41,6 +41,7 @@ def main(batch: int = 2048, horizon: int = 32, modes: tuple[str, ...] = ("eager"
     start = StartBatch(
         state=s0,
         xi=torch.zeros(batch, 33, device=dev) + torch.tensor([0.75] + [0.0] * 32, device=dev),
+        immune=torch.zeros(batch, dtype=torch.bool, device=dev),
         frame=f,
         prev_action=torch.zeros(batch, 29, device=dev),
         hist_states=s0[None].expand(10, batch, 71).contiguous(),

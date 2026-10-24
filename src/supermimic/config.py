@@ -33,6 +33,11 @@ class EnvCfg:
     future_frames: int = 10
     compact_library: bool = False
     anchor_obs: bool = False
+    immune_probability: float = 0.0  # episodes without root terminations, for get-up training (plan D22)
+    lie_probability: float = 0.0  # resets that start lying on the floor (D22)
+    push_interval_s: tuple[float, float] | None = None  # knock-down pushes (D22); None = off
+    push_speed: tuple[float, float] = (4.0, 6.0)
+    push_down_prob: float = 0.3
 
 
 @dataclass

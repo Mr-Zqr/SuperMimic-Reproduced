@@ -98,7 +98,7 @@ def imagine(
     for t in range(horizon):
         obs_flat = flatten_history_term_major(torch.stack(hist, 0))
         a = policy(obs_flat, goals[-1])
-        s_next, r, term_vec, logits, obs_clean, anchor_pose = step_fn(s, a, a_prev, start.xi, ref)
+        s_next, r, term_vec, logits, obs_clean, anchor_pose = step_fn(s, a, a_prev, start.xi, start.immune, ref)
         d = torch.sigmoid(logits)
         c = c * (1.0 - d)
         term_sum += term_vec.detach().mean(-1)

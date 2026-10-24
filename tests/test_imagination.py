@@ -39,6 +39,7 @@ def test_training_smoke(tmp_path):
     cfg.data.clips = ["walk1_subject1"]
     cfg.env.num_envs = 128
     cfg.env.replay_capacity = 200
+    cfg.env.immune_probability = 0.5  # exercises the D22 paths (buffer, WM gate, critic input)
     cfg.world_model.hidden = (256, 256)
     cfg.policy.encoder_hidden = (256, 128)
     cfg.policy.decoder_hidden = (256, 128)
@@ -60,6 +61,11 @@ def test_training_smoke(tmp_path):
         tr.env.close()
         tr2 = Trainer(cfg2)
         assert tr2.iteration == 60
+        # A resumed run refills the (unsaved) replay buffer before updating again.
+        tr2.cfg.schedule.total_iterations = 90
+        updates = tr2.num_updates
+        tr2.run()
+        assert tr2.iteration == 90 and tr2.num_updates > updates
         tr2.env.close()
     finally:
         pass

@@ -61,6 +61,7 @@ class PolicyTrainer:
         cfg = self.cfg
         start = buffer.sample_starts(cfg.batch_size, cfg.history)
         xi_norm = self.wm.spec.normalize_xi(start.xi)
+        immune = start.immune.float()[:, None]
 
         # ---- actor: BPTT through the frozen world model ------------------------------------
         self.wm.requires_grad_(False)
@@ -68,7 +69,7 @@ class PolicyTrainer:
         ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, cfg.future_frames, obs_noise=cfg.obs_noise, step_fn=self.step_fn, anchor_obs=cfg.anchor_obs)
         feat, goals, e_root = self._critic_inputs(ro)
         if cfg.use_critic:
-            v_H = self.critic(feat[-1], goals[-1], xi_norm, e_root[-1])
+            v_H = self.critic(feat[-1], goals[-1], xi_norm, e_root[-1], immune)
         else:
             v_H = None
         J = policy_objective(ro, v_H, cfg.gamma)
@@ -90,6 +91,7 @@ class PolicyTrainer:
             "imag_dhat_mean": float(ro.dhat[1:].mean().detach()),
             "policy_grad_norm": float(gn),
             "action_abs_mean": float(ro.actions.abs().mean().detach()),
+            "imag_immune_frac": float(immune.mean()),
         }
         for k, v in ro.reward_terms.items():
             metrics[f"imag_r/{k}"] = v
@@ -100,12 +102,14 @@ class PolicyTrainer:
                 feat_d, goals_d, e_root_d = feat.detach(), goals.detach(), e_root.detach()
                 H1, n, _ = feat_d.shape
                 xi_rep = xi_norm[None].expand(H1, n, -1)
-                values = self.critic(feat_d.reshape(H1 * n, -1), goals_d.reshape(H1 * n, -1), xi_rep.reshape(H1 * n, -1), e_root_d.reshape(H1 * n, -1)).reshape(H1, n)
+                im_rep = immune[None].expand(H1, n, 1)
+                values = self.critic(feat_d.reshape(H1 * n, -1), goals_d.reshape(H1 * n, -1), xi_rep.reshape(H1 * n, -1), e_root_d.reshape(H1 * n, -1), im_rep.reshape(H1 * n, 1)).reshape(H1, n)
                 targets = gae_targets(ro.rewards.detach(), ro.dhat[1:].detach(), values, cfg.gamma, cfg.gae_lambda)  # (H, n)
                 X_feat = feat_d[:-1].reshape(-1, feat_d.shape[-1])
                 X_goal = goals_d[:-1].reshape(-1, goals_d.shape[-1])
                 X_xi = xi_rep[:-1].reshape(-1, xi_rep.shape[-1])
                 X_er = e_root_d[:-1].reshape(-1, 4)
+                X_im = im_rep[:-1].reshape(-1, 1)
                 Y = targets.reshape(-1)
             N = Y.shape[0]
             mb = N // cfg.critic_minibatches
@@ -114,7 +118,7 @@ class PolicyTrainer:
                 perm = torch.randperm(N, device=Y.device)
                 for i in range(cfg.critic_minibatches):
                     idx = perm[i * mb : (i + 1) * mb]
-                    pred = self.critic(X_feat[idx], X_goal[idx], X_xi[idx], X_er[idx])
+                    pred = self.critic(X_feat[idx], X_goal[idx], X_xi[idx], X_er[idx], X_im[idx])
                     closs = torch.nn.functional.mse_loss(pred, Y[idx])
                     self.critic_opt.zero_grad(set_to_none=True)
                     closs.backward()

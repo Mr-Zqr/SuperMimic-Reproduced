@@ -67,6 +67,11 @@ class Trainer:
                 replay_capacity=cfg.env.replay_capacity,
                 compact_library=cfg.env.compact_library,
                 anchor_obs=cfg.env.anchor_obs,
+                immune_probability=cfg.env.immune_probability,
+                lie_probability=cfg.env.lie_probability,
+                push_interval_s=cfg.env.push_interval_s,
+                push_speed=cfg.env.push_speed,
+                push_down_prob=cfg.env.push_down_prob,
                 seed=cfg.seed + 1000 * self.rank,
             ),
             device=self.device,
@@ -127,10 +132,15 @@ class Trainer:
         ck = torch.load(path, map_location=self.device, weights_only=False)
         self.wm.load_state_dict(ck["wm"])
         self.policy.load_state_dict(ck["policy"])
+        critic_upgraded = Critic.upgrade_state_dict(ck["critic"])
         self.critic.load_state_dict(ck["critic"])
         self.wm_trainer.opt.load_state_dict(ck["wm_opt"])
         self.policy_trainer.opt.load_state_dict(ck["policy_opt"])
-        self.policy_trainer.critic_opt.load_state_dict(ck["critic_opt"])
+        if critic_upgraded:
+            # Adam moments of the old first layer no longer match its shape: restart the critic optimizer.
+            print("[INFO] pre-D22 checkpoint: critic gets a zero-initialised immune input, critic optimizer reset")
+        else:
+            self.policy_trainer.critic_opt.load_state_dict(ck["critic_opt"])
         self.command.bin_return.copy_(ck["bin_return"])
         self.command.bin_memory.copy_(ck["bin_memory"])
         self.iteration = ck["iteration"]
@@ -148,18 +158,23 @@ class Trainer:
         sch = cfg.schedule
         env = self.env
         obs, _ = env.reset()
+        # The replay buffer is not checkpointed: a resumed run refills it before its first update.
+        start_iteration = self.iteration
         t_start = time.time()
         timers = {"sim": 0.0, "wm": 0.0, "policy": 0.0}
         agg: dict[str, float] = {}
         agg_n = 0
         finished_returns: list[float] = []
         finished_lens: list[float] = []
+        immune_returns: list[float] = []  # immune episodes (D22) are logged apart from the paper metric
+        immune_lens: list[float] = []
         last_log = time.time()
 
         while self.iteration < sch.total_iterations:
             # ---------------- (1) collect one vectorised env step
             t0 = time.perf_counter()
             action = self.act(obs)
+            immune = self.command.immune.clone()  # flags of the episodes this step belongs to (reset resamples them)
             obs, rew, term, tout, extras = env.step(action)
             self.ep_reward_sum += rew
             self.ep_len += 1
@@ -168,8 +183,11 @@ class Trainer:
                 ids = done.nonzero().squeeze(-1)
                 lens = self.ep_len[ids]
                 norm_ret = self.ep_reward_sum[ids] / (self.max_step_reward * lens.clamp_min(1))
-                finished_returns.extend(norm_ret.tolist())
-                finished_lens.extend(lens.tolist())
+                im = immune[ids]
+                finished_returns.extend(norm_ret[~im].tolist())
+                finished_lens.extend(lens[~im].tolist())
+                immune_returns.extend(norm_ret[im].tolist())
+                immune_lens.extend(lens[im].tolist())
                 self.ep_reward_sum[ids] = 0.0
                 self.ep_len[ids] = 0.0
             torch.cuda.synchronize()
@@ -177,7 +195,7 @@ class Trainer:
             self.iteration += 1
 
             # ---------------- (2)+(3) updates at the configured update-to-data ratio
-            if self.iteration >= sch.warmup_iterations:
+            if self.iteration - start_iteration >= sch.warmup_iterations:
                 self._utd_acc += sch.updates_per_env_step
                 while self._utd_acc >= 1.0:
                     self._utd_acc -= 1.0
@@ -216,6 +234,7 @@ class Trainer:
                 if not self.is_main:
                     agg, agg_n = {}, 0
                     finished_returns, finished_lens = [], []
+                    immune_returns, immune_lens = [], []
                     timers = {k: 0.0 for k in timers}
                 elif agg_n > 0:
                     for k, v in agg.items():
@@ -228,6 +247,9 @@ class Trainer:
                     self.writer.add_scalar("train/episode_len", sum(finished_lens) / max(len(finished_lens), 1), it)
                 else:
                     tr = float("nan")
+                if self.is_main and immune_returns:
+                    self.writer.add_scalar("train/immune_episode_norm_return", sum(immune_returns) / len(immune_returns), it)
+                    self.writer.add_scalar("train/immune_episode_len", sum(immune_lens) / len(immune_lens), it)
                 with torch.no_grad():
                     if self.is_main and self.buffer.size > 2048:
                         err = self.wm_trainer.online_error(self.buffer, n=1024, k=8)
@@ -242,6 +264,8 @@ class Trainer:
                     self.writer.add_scalar("time/updates", self.num_updates, it)
                     self.writer.add_scalar("sampler/entropy", float(self.command.metrics["sampling_entropy"][0]), it)
                     self.writer.add_scalar("sampler/bin_return_mean", float(self.command.bin_return.mean()), it)
+                    self.writer.add_scalar("train/immune_frac", float(self.command.immune.float().mean()), it)
+                    self.writer.add_scalar("train/lying_frac", float(self.command.lying.float().mean()), it)
                     dt_log = time.time() - last_log
                     last_log = time.time()
                     msg = (
@@ -254,6 +278,7 @@ class Trainer:
                     print(msg, flush=True)
                 agg, agg_n = {}, 0
                 finished_returns, finished_lens = [], []
+                immune_returns, immune_lens = [], []
                 timers = {k: 0.0 for k in timers}
             if self.iteration % sch.checkpoint_interval == 0:
                 self.save("ckpt_latest.pt")

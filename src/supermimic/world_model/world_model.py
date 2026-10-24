@@ -12,6 +12,9 @@ from supermimic.world_model.dynamics import MLP, DynamicsMLP
 from supermimic.world_model.heads import AnalyticHeads, ReferenceFrame
 from supermimic.world_model.state_spec import StateSpec, StateSpecCfg
 
+# Termination logit of an immune episode (plan D22): sigmoid(-30) ~ 1e-13, and no gradient reaches the head.
+IMMUNE_LOGIT = -30.0
+
 
 @dataclass
 class WorldModelCfg:
@@ -55,34 +58,41 @@ class WorldModel(nn.Module):
         delta = self.dynamics(feat, action, self.spec.normalize_xi(xi))
         return self.spec.integrate(s, delta)
 
-    def termination_logits(self, s_next: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
+    def termination_logits(self, s_next: torch.Tensor, ref: ReferenceFrame, immune: torch.Tensor | None = None) -> torch.Tensor:
+        """immune (…,) bool: the episode's root terminations are disabled, so it cannot terminate."""
         # The pelvis is the free-joint body, so its pose is the state's root pose: no FK needed.
         feats = self.heads.termination_features(s_next[..., 0:3], s_next[..., 3:7], ref)
-        return self.term_head(feats)
+        logits = self.term_head(feats)
+        return logits if immune is None else logits.masked_fill(immune, IMMUNE_LOGIT)
 
     # ------------------------------------------------------------------ Eq. 1
 
-    def _loss_step(self, s, a, xi, s_true, done, ref_root_pos, ref_root_quat):
-        """One autoregressive step of Eq. 1: returns (s_next, sq_err (n,70), term_bce (n,), logits (n,))."""
+    def _loss_step(self, s, a, xi, s_true, done, ref_root_pos, ref_root_quat, live):
+        """One autoregressive step of Eq. 1: returns (s_next, sq_err (n,70), term_bce (n,), logits (n,)).
+
+        live (n,) float: 0 for immune episodes, whose labels say nothing about the termination rule.
+        """
         s_next = self.step(s, a, xi)
         e = self.spec.error_vector(s_next, s_true)
         feats = self.heads.termination_features(s_next[..., 0:3], s_next[..., 3:7], ReferenceFrame(None, None, None, None, ref_root_pos, ref_root_quat))
         logits = self.term_head(feats)
-        bce = F.binary_cross_entropy_with_logits(logits, done, reduction="none")
+        bce = F.binary_cross_entropy_with_logits(logits, done, reduction="none") * live
         return s_next, e * e, bce, logits
 
     def enable_compile(self, mode: str | None = "default") -> None:
         self._loss_step_fn = torch.compile(self._loss_step, mode=None if mode == "default" else mode, dynamic=False) if mode else self._loss_step
 
-    def window_loss(self, states: torch.Tensor, a_exec: torch.Tensor, xi: torch.Tensor, done: torch.Tensor, refs: list[ReferenceFrame]):
+    def window_loss(self, states: torch.Tensor, a_exec: torch.Tensor, xi: torch.Tensor, done: torch.Tensor, refs: list[ReferenceFrame], immune: torch.Tensor | None = None):
         """k-step autoregressive loss.
 
         states: (k+1, n, 71) logged states; a_exec: (k, n, 29); xi: (n, 33);
         done: (k, n) termination label of states 1..k; refs[j]: reference of transition j (for the
-        termination features of state j+1).
+        termination features of state j+1); immune: (n,) bool, excluded from the termination loss.
         """
         k = a_exec.shape[0]
         s = states[0]
+        live = torch.ones_like(done[0]) if immune is None else (~immune).to(done.dtype)
+        n_live = live.sum().clamp_min(1.0)
         total_state = 0.0
         total_term = 0.0
         metrics = {}
@@ -91,15 +101,15 @@ class WorldModel(nn.Module):
         acc_num = 0.0
         step_fn = getattr(self, "_loss_step_fn", None) or self._loss_step
         for j in range(k):
-            s, sq, bce, logits = step_fn(s, a_exec[j], xi, states[j + 1], done[j], refs[j].root_pos_w, refs[j].root_quat_w)
+            s, sq, bce, logits = step_fn(s, a_exec[j], xi, states[j + 1], done[j], refs[j].root_pos_w, refs[j].root_quat_w, live)
             total_state = total_state + sq.sum(-1).mean()
-            total_term = total_term + bce.mean()
+            total_term = total_term + bce.sum() / n_live
             with torch.no_grad():
                 nse = sq.mean(-1).mean()
                 if j == 0:
                     err_first = nse
                 err_last = nse
-                acc_num += ((logits > 0).float() == done[j]).float().mean()
+                acc_num += (((logits > 0).float() == done[j]).float() * live).sum() / n_live
         loss = total_state / k + self.cfg.term_loss_weight * total_term / k
         # Metrics stay on-device (detached tensors): a float() here would stall the CPU on the
         # forward pass every minibatch, which in data-parallel runs turns into lockstep waiting.

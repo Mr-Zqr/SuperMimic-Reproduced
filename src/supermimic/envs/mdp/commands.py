@@ -7,6 +7,8 @@ functions work unchanged, plus:
 * ``goal``        (N, K*68) future-frame goal features (plan D5)
 * ``root_*``      reference pelvis quantities for the paper's root terminations
 * ``clip_end``    (N,) True once the clip's last frame has been reached (time-out)
+* ``immune``      (N,) True for episodes whose root terminations are disabled (get-up training, D22)
+* ``lying``       (N,) True for episodes that started with the robot dropped onto the floor (D22)
 * return-based reset sampling over 1 s bins of the whole library (plan D14)
 """
 
@@ -61,6 +63,10 @@ class MultiClipMotionCommand(CommandTerm):
         n = self.num_envs
         self.frame = torch.zeros(n, dtype=torch.long, device=self.device)
         self.clip_end = torch.zeros(n, dtype=torch.bool, device=self.device)
+        # Drawn once per episode so the flag is an episode constant like xi (world model / critic input).
+        self.immune = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.pushed = torch.zeros(n, dtype=torch.bool, device=self.device)  # set by events.big_push
+        self.lying = torch.zeros(n, dtype=torch.bool, device=self.device)
         self._refresh_ref()
         self.body_pos_relative_w = torch.zeros(n, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(n, len(cfg.body_names), 4, device=self.device)
@@ -207,6 +213,13 @@ class MultiClipMotionCommand(CommandTerm):
     def _finalize_episodes(self, env_ids: torch.Tensor) -> None:
         """Fold the finished episodes' discounted returns-to-go into the per-bin estimates."""
         cfg = self.cfg
+        # After a fall an immune episode keeps logging near-zero rewards against the following bins, and a
+        # pushed episode may fall wherever the push lands: neither says how hard the bins are.
+        skip = self.pushed[env_ids]
+        if cfg.sampler_skip_immune:
+            skip = skip | self.immune[env_ids]
+        self.ep_len[env_ids[skip]] = 0
+        env_ids = env_ids[~skip]
         lens = self.ep_len[env_ids]
         if lens.sum() == 0:
             return
@@ -294,6 +307,17 @@ class MultiClipMotionCommand(CommandTerm):
         forced = self.forced_frame[env_ids]
         self.frame[env_ids] = torch.where(forced >= 0, forced, sampled)
         self.clip_end[env_ids] = False
+        self.pushed[env_ids] = False
+        # immune_probability is the target fraction of *live* envs: immune episodes outlast the others,
+        # so a fixed per-reset probability would let them take over. Fill the remaining quota instead.
+        others = self.immune.clone()
+        others[env_ids] = False
+        p = ((self.cfg.immune_probability * self.num_envs - others.sum()) / len(env_ids)).clamp(0.0, 1.0)
+        self.immune[env_ids] = (torch.rand(len(env_ids), device=self.device) < p) & (forced < 0)
+        # Lying starts must be immune, or the root terminations would end them on the first step.
+        lying = (torch.rand(len(env_ids), device=self.device) < self.cfg.lie_probability) & (forced < 0)
+        self.lying[env_ids] = lying
+        self.immune[env_ids] |= lying
 
         r = self.library.ref(self.frame[env_ids])
         root_pos = r.root_pos_w + self._env.scene.env_origins[env_ids]
@@ -315,8 +339,32 @@ class MultiClipMotionCommand(CommandTerm):
         lo, hi = self.cfg.joint_position_range
         if hi > lo:
             joint_pos = joint_pos + sample_uniform(lo, hi, joint_pos.shape, device=self.device)
+        if lying.any():
+            # Reference joint pose, body horizontal, at rest, dropped from a height that clears limbs
+            # pointing at the floor (an outstretched arm reaches ~0.4 m from the pelvis).
+            k = int(lying.sum())
+            root_pos[lying, 2] = self._env.scene.env_origins[env_ids[lying], 2] + sample_uniform(*self.cfg.lie_height, (k,), device=self.device)
+            root_ori[lying] = self._lying_quat(k)
+            root_lin_vel[lying] = 0.0
+            root_ang_vel[lying] = 0.0
+            joint_vel = torch.where(lying[:, None], torch.zeros_like(joint_vel), joint_vel)
 
         self._write_reference_state_to_sim(env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel)
+
+    def _lying_quat(self, n: int) -> torch.Tensor:
+        """Random lying orientations: face down (pitch +90 deg), face up (pitch -90 deg) or on either side
+        (roll +-90 deg) with ``lie_pose_probs``, a random heading and +-0.3 rad of extra roll/pitch."""
+        d = self.device
+        z = torch.zeros(n, device=d)
+        kind = torch.multinomial(torch.tensor(self.cfg.lie_pose_probs, device=d), n, replacement=True)
+        half_pi = math.pi / 2
+        pitch = torch.where(kind == 0, half_pi, torch.where(kind == 1, -half_pi, 0.0))
+        side = torch.where(torch.rand(n, device=d) < 0.5, half_pi, -half_pi)
+        roll = torch.where(kind == 2, side, 0.0)
+        q = quat_from_euler_xyz(roll, pitch, z)
+        jitter = quat_from_euler_xyz(sample_uniform(-0.3, 0.3, (n,), device=d), sample_uniform(-0.3, 0.3, (n,), device=d), z)
+        yaw = quat_from_euler_xyz(z, z, sample_uniform(-math.pi, math.pi, (n,), device=d))
+        return quat_mul(yaw, quat_mul(q, jitter))
 
     def update_relative_body_poses(self) -> None:
         nb = len(self.cfg.body_names)
@@ -354,6 +402,9 @@ class MultiClipMotionCommand(CommandTerm):
         self.ep_len[env_ids] = 0
         self.frame[env_ids] = frame
         self.clip_end[env_ids] = False
+        self.immune[env_ids] = False
+        self.pushed[env_ids] = False
+        self.lying[env_ids] = False
         r = self.library.ref(frame)
         self._write_reference_state_to_sim(
             env_ids, r.root_pos_w + self._env.scene.env_origins[env_ids], r.root_quat_w, r.root_lin_vel_w, r.root_ang_vel_w, r.joint_pos, r.joint_vel
@@ -417,6 +468,14 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     ema_alpha: float = 0.05
     memory_alpha: float = 0.01
     min_remaining_steps: int = 100
+    # Get-up training (plan D22): target fraction of live envs whose root height / tilt terminations are
+    # disabled for the whole episode, so a fallen robot keeps rolling out until the clip end or time-out.
+    immune_probability: float = 0.0
+    sampler_skip_immune: bool = True  # immune episodes do not update G_b
+    # Fraction of resets that start lying on the floor (always immune; D22) and its pose distribution.
+    lie_probability: float = 0.0
+    lie_pose_probs: tuple[float, float, float] = (0.4, 0.3, 0.3)  # face down, face up, on a side
+    lie_height: tuple[float, float] = (0.35, 0.55)  # pelvis drop height above the floor (m)
     max_logged_steps: int = 1024
     compact_library: bool = False
     library_fp16: bool = True

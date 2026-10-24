@@ -83,14 +83,32 @@ class Policy(nn.Module):
 
 
 class Critic(nn.Module):
-    """V(canonical state 71, goal 680, xi 33, root error 4) -> scalar (one per interface)."""
+    """V(canonical state 71, goal 680, xi 33, root error 4, immune 1) -> scalar (one per interface).
+
+    ``immune`` (plan D22) is critic-only: a fallen immune episode keeps earning reward, a fallen
+    ordinary one is terminated, so the two have different values from the same state.
+    """
 
     def __init__(self, cfg: CriticCfg, feat_dim: int = 71, goal_dim: int | None = None, xi_dim: int = 33, pcfg: PolicyCfg | None = None):
         super().__init__()
         pcfg = pcfg or PolicyCfg()
         goal_dim = goal_dim or pcfg.goal_dim
-        self.mlp = MLP(feat_dim + goal_dim + xi_dim + 4, cfg.hidden, 1)
+        self.mlp = MLP(feat_dim + goal_dim + xi_dim + 4 + 1, cfg.hidden, 1)
         self.register_buffer("goal_scale", _goal_scale_vector(pcfg, goal_dim))
 
-    def forward(self, feat: torch.Tensor, goal: torch.Tensor, xi_norm: torch.Tensor, e_root: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([feat, goal * self.goal_scale, xi_norm, e_root], dim=-1)).squeeze(-1)
+    def forward(self, feat: torch.Tensor, goal: torch.Tensor, xi_norm: torch.Tensor, e_root: torch.Tensor, immune: torch.Tensor) -> torch.Tensor:
+        """immune: (…, 1) float."""
+        return self.mlp(torch.cat([feat, goal * self.goal_scale, xi_norm, e_root, immune], dim=-1)).squeeze(-1)
+
+    @staticmethod
+    def upgrade_state_dict(sd: dict) -> bool:
+        """Add a zero input column for ``immune`` to a pre-D22 critic state dict in place; True if changed."""
+        w = sd["mlp.net.0.weight"]
+        if w.shape[1] == 71 + 33 + 4 + _goal_dim_of(sd):
+            sd["mlp.net.0.weight"] = torch.cat([w, torch.zeros_like(w[:, :1])], dim=1)
+            return True
+        return False
+
+
+def _goal_dim_of(critic_sd: dict) -> int:
+    return critic_sd["goal_scale"].shape[0]

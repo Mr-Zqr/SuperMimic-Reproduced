@@ -21,6 +21,7 @@ class WindowBatch:
     a_exec: torch.Tensor  # (k, n, A)
     a_clean: torch.Tensor  # (k, n, A)
     xi: torch.Tensor  # (n, X) context at the window start (constant inside an episode)
+    immune: torch.Tensor  # (n,) bool: root terminations disabled for this episode (D22)
     reward: torch.Tensor  # (k, n)
     done: torch.Tensor  # (k, n) termination label of states 1..k
     frame: torch.Tensor  # (k, n) target frame of each transition
@@ -30,6 +31,7 @@ class WindowBatch:
 class StartBatch:
     state: torch.Tensor  # (n, S)
     xi: torch.Tensor  # (n, X)
+    immune: torch.Tensor  # (n,) bool
     frame: torch.Tensor  # (n,) current target frame
     prev_action: torch.Tensor  # (n, A) clean action of the previous step (0 at episode start)
     hist_states: torch.Tensor  # (hist, n, S) states s_{t-hist+1..t} (backfilled at episode start)
@@ -52,6 +54,9 @@ class ReplayBuffer:
         self.clip = torch.zeros(E, T, dtype=torch.long, device=self.device)
         self.ep_id = torch.full((E, T), -1, dtype=torch.long, device=self.device)
         self.terminal = torch.zeros(E, T, dtype=torch.bool, device=self.device)
+        self.immune = torch.zeros(E, T, dtype=torch.bool, device=self.device)
+        # The next row's state is not the outcome of this row's transition (external push, D22).
+        self.cut = torch.zeros(E, T, dtype=torch.bool, device=self.device)
         self.ep_start = torch.zeros(E, T, dtype=torch.bool, device=self.device)
         self.valid = torch.zeros(E, T, dtype=torch.bool, device=self.device)
         self.ptr = torch.zeros(E, dtype=torch.long, device=self.device)
@@ -62,7 +67,7 @@ class ReplayBuffer:
     # ------------------------------------------------------------------ writes
 
     @torch.no_grad()
-    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start) -> None:
+    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start, immune=None, cut=None) -> None:
         p = self.ptr[env_ids]
         self.s[env_ids, p] = s
         self.a[env_ids, p] = a
@@ -75,6 +80,8 @@ class ReplayBuffer:
         self.ep_id[env_ids, p] = self.ep_counter[env_ids]
         self.terminal[env_ids, p] = terminal
         self.ep_start[env_ids, p] = ep_start
+        self.immune[env_ids, p] = False if immune is None else immune
+        self.cut[env_ids, p] = False if cut is None else cut
         self.valid[env_ids, p] = True
         self.ptr[env_ids] = (p + 1) % self.T
         self.total_rows += int(env_ids.numel())
@@ -95,13 +102,13 @@ class ReplayBuffer:
 
     @torch.no_grad()
     def window_mask(self, k: int) -> torch.Tensor:
-        """(E,T) True where rows t..t+k are valid, same episode, and t..t+k-1 are non-terminal."""
-        ok = self.valid & ~self.terminal
+        """(E,T) True where rows t..t+k are valid, same episode, and t..t+k-1 are non-terminal and not cut."""
+        ok = self.valid & ~self.terminal & ~self.cut
         ep0 = self.ep_id
         for j in range(1, k + 1):
             v = self._rolled(self.valid, j) & (self._rolled(ep0, j) == ep0)
             if j < k:
-                v &= ~self._rolled(self.terminal, j)
+                v &= ~self._rolled(self.terminal, j) & ~self._rolled(self.cut, j)
             ok &= v
         # The row currently under the write pointer may be overwritten next; the rolled window must not
         # wrap across the write pointer. Rows t with t + k crossing ptr are excluded by the ep_id test
@@ -131,6 +138,7 @@ class ReplayBuffer:
             a_exec=self.a_exec[ee[:-1], tt[:-1]],
             a_clean=self.a[ee[:-1], tt[:-1]],
             xi=self.xi[e, t],
+            immune=self.immune[e, t],
             reward=self.r[ee[:-1], tt[:-1]],
             done=self.done[ee[1:], tt[1:]],
             frame=self.frame[ee[:-1], tt[:-1]],
@@ -160,6 +168,7 @@ class ReplayBuffer:
         return StartBatch(
             state=self.s[e, t],
             xi=self.xi[e, t],
+            immune=self.immune[e, t],
             frame=self.frame[e, t],
             prev_action=hist_actions[-1],
             hist_states=hist_states,
